@@ -27,6 +27,25 @@ if Path("DortaniaInternalResources.dmg").exists():
    datas.append(('DortaniaInternalResources.dmg', '.'))
 
 
+def _host_target_arch() -> str:
+   """
+   Match the interpreter. A thin Homebrew Python cannot thin or lipo
+   extension modules into a universal2 app.
+   """
+   result = subprocess.run(
+      ["/usr/bin/lipo", "-archs", sys.executable],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+   )
+   archs = set(result.stdout.split())
+   if {"x86_64", "arm64"}.issubset(archs):
+      return "universal2"
+   if "arm64" in archs:
+      return "arm64"
+   return "x86_64"
+
+
 a = Analysis(['OpenCore-Patcher-GUI.command'],
              pathex=[],
              binaries=[],
@@ -56,7 +75,7 @@ exe = EXE(pyz,
           upx=True,
           console=False,
           disable_windowed_traceback=False,
-          target_arch="universal2",
+          target_arch=_host_target_arch(),
           codesign_identity=None,
           entitlements_file=None)
 
