@@ -5,9 +5,10 @@ sys_patch_helpers.py: Additional support functions for sys_patch.py
 import os
 import logging
 import plistlib
+import re
 import subprocess
 
-from typing import Union
+from typing import Optional, Union
 from pathlib import Path
 from datetime import datetime
 
@@ -20,6 +21,128 @@ from ..support import (
     generate_smbios,
     subprocess_wrapper
 )
+
+
+# ImageIOOld from the Kepler Tahoe payload links these private codecs by absolute path.
+# They are not in the dyld shared cache as a stable ABI: a 15.6 client bound to the
+# host libJP2 executes a ud2 trap inside initialize_buffer_surface, and iconservicesagent
+# crash-loops while compositing JPEG 2000 icon stacks.
+_IMAGEIO_RESOURCE_DEP = re.compile(
+    r"^\s*(/System/Library/Frameworks/ImageIO\.framework/Versions/A/Resources/(\S+\.dylib))\s+"
+    r"\(compatibility version [0-9.]+, current version ([0-9.]+)\)\s*$"
+)
+_CURRENT_VERSION = re.compile(r"current version ([0-9.]+)")
+
+
+def _otool_load_commands(binary: Path) -> str:
+    """
+    Return `otool -L` output for a thin or x86_64 Mach-O.
+    """
+    for command in (
+        ["/usr/bin/otool", "-arch", "x86_64", "-L", str(binary)],
+        ["/usr/bin/otool", "-L", str(binary)],
+    ):
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0 and "current version" in result.stdout:
+            return result.stdout
+    return ""
+
+
+def _dylib_current_version(binary: Path) -> Optional[str]:
+    """
+    LC_ID_DYLIB current version, from the first load-command line.
+    """
+    lines = _otool_load_commands(binary).splitlines()
+    if len(lines) < 2:
+        return None
+    match = _CURRENT_VERSION.search(lines[1])
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def resolve_imageio_merge(source_framework: Path, payload_root: Path) -> tuple[bool, dict[str, Path]]:
+    """
+    Decide whether a merged ImageIO.framework is safe to install.
+
+    The Tahoe Kepler payload replaces ImageIO with a reexport stub plus ImageIOOld.
+    ImageIOOld was linked against its own Resources codecs (libJP2.dylib and the
+    other ImageIO resource dylibs). Those files live in the host dyld shared cache
+    and are not the build ImageIOOld was linked to, so dyld binds the host copies.
+
+    Returns:
+        (True, extras): safe to merge. `extras` maps framework-relative codec paths
+            to payload files that must be copied afterwards because they are not
+            already inside the framework.
+        (False, {}): do not merge. The stock ImageIO must stay so it keeps using
+            the matching host libJP2.
+    """
+    imageio_old = source_framework / "Versions" / "A" / "ImageIOOld.dylib"
+    if not imageio_old.exists():
+        return True, {}
+
+    dependencies: dict[str, str] = {}
+    for line in _otool_load_commands(imageio_old).splitlines():
+        match = _IMAGEIO_RESOURCE_DEP.match(line)
+        if match is None:
+            continue
+        dependencies[match.group(2)] = match.group(3)
+
+    if not dependencies:
+        return True, {}
+
+    extras: dict[str, Path] = {}
+    unresolved: dict[str, str] = {}
+    for library_name, wanted_version in dependencies.items():
+        relative = Path("Versions") / "A" / "Resources" / library_name
+        bundled = source_framework / relative
+        if bundled.is_file() and _dylib_current_version(bundled) == wanted_version:
+            continue
+        unresolved[library_name] = wanted_version
+
+    if unresolved and payload_root.exists():
+        found = _find_payload_codecs(payload_root, unresolved, source_framework)
+        for library_name in list(unresolved):
+            companion = found.get(library_name)
+            if companion is None:
+                continue
+            relative = Path("Versions") / "A" / "Resources" / library_name
+            extras[str(relative)] = companion
+            unresolved.pop(library_name)
+
+    if unresolved:
+        missing = [f"{name} (current version {version})" for name, version in unresolved.items()]
+        logging.error("- ImageIO codec mismatch, not installing ImageIO.framework: " + ", ".join(missing))
+        logging.error(
+            "- ImageIOOld would bind the host dyld-shared-cache codecs. "
+            "libJP2 then traps (ud2) in initialize_buffer_surface and iconservicesagent crash-loops."
+        )
+        return False, {}
+
+    return True, extras
+
+
+def _find_payload_codecs(payload_root: Path, wanted: dict[str, str], source_framework: Path) -> dict[str, Path]:
+    """
+    Find payload copies of ImageIO resource codecs with the linked current version.
+    """
+    found: dict[str, Path] = {}
+    framework_root = source_framework.resolve()
+    for directory, _dirnames, filenames in os.walk(payload_root):
+        for library_name, wanted_version in wanted.items():
+            if library_name in found or library_name not in filenames:
+                continue
+            candidate = Path(directory) / library_name
+            try:
+                if framework_root in candidate.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            if _dylib_current_version(candidate) == wanted_version:
+                found[library_name] = candidate
+        if len(found) == len(wanted):
+            break
+    return found
 
 
 class SysPatchHelpers:

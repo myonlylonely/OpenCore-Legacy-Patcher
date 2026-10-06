@@ -49,6 +49,7 @@ from .mount import (
 from .utilities import (
     install_new_file,
     remove_file,
+    fix_permissions,
     PatcherSupportPkgMount,
     KernelDebugKitMerge
 )
@@ -75,6 +76,7 @@ from . import (
     sys_patch_helpers,
     kernelcache
 )
+from .sys_patch_helpers import resolve_imageio_merge
 from .auto_patcher import InstallAutomaticPatchingServices
 
 
@@ -453,7 +455,26 @@ class PatchSysVolume:
 
                             destination_folder_path = updated_destination_folder_path
 
+                        extra_codecs = {}
+                        if install_file == "ImageIO.framework":
+                            should_install, extra_codecs = resolve_imageio_merge(
+                                Path(source_folder_path) / install_file,
+                                Path(source_files_path),
+                            )
+                            if should_install is False:
+                                continue
+
                         install_new_file(source_folder_path, destination_folder_path, install_file, method_install)
+
+                        for relative_path, codec_source in extra_codecs.items():
+                            destination_codec = Path(destination_folder_path) / install_file / relative_path
+                            logging.info(f"  - Installing ImageIO codec: {relative_path}")
+                            subprocess_wrapper.run_as_root_and_verify(
+                                generate_copy_arguments(str(codec_source), str(destination_codec.parent)),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                            )
+                            fix_permissions(destination_codec)
 
             if PatchType.EXECUTE in required_patches[patch]:
                 for process in required_patches[patch][PatchType.EXECUTE]:
