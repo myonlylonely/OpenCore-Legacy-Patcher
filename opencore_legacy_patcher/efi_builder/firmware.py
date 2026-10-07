@@ -205,6 +205,13 @@ class BuildFirmware:
             logging.info("- Adding IOHIDFamily patch")
             support.BuildSupport(self.model, self.constants, self.config).get_item_by_kv(self.config["Kernel"]["Patch"], "Identifier", "com.apple.iokit.IOHIDFamily")["Enabled"] = True
 
+        # macOS 26.7 IOHIDDevice::didTerminate reads a NULL event-source pointer
+        # (this+0xc8) while the registry is tearing down, so shutdown and restart
+        # panic. Skip that teardown and continue into IOService::didTerminate.
+        # The find pattern is specific to this kext; a mismatch is ignored.
+        logging.info("- Skipping null IOHIDDevice event source during shutdown")
+        support.BuildSupport(self.model, self.constants, self.config).get_item_by_kv(self.config["Kernel"]["Patch"], "Comment", "Skip null IOHIDDevice event source during shutdown")["Enabled"] = True
+
         # MacPro3,1/Xserve2,1 cannot boot with more than 4 threads in Sequoia
         # Note cpus=4 only overrides if more than 4 threads are present. So same on dual-core units
         if self.constants.force_quad_thread is True:
